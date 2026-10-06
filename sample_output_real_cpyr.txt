@@ -1,0 +1,429 @@
+
+==============================================================================
+  SCENARIO: normal — Full manufacturing (S1–S40) + field boot (B1–B11)   [real CPYR]
+==============================================================================
+
+▶ [S1] Generate root keys in the HSM (PKC, fTPM manufacturer CA, OEM_K1/K2)
+   · PKC = ECDSA P-256 boot-chain signing key; manufacturer CA = ECDSA P-256
+   ✔ OEM_K1 / OEM_K2 generated — will only ever exist in the HSM and in fuses
+
+▶ [S2–S4] Request FSKP keys from NVIDIA, unwrap in the HSM
+   · deliver oem_publickey.cer (RSA, SHA-256 fingerprint 554d841aa583e32f…, confirm out of band)
+   ✔ Results.zip: fskp_ak / fskp_ek .rsa_wrap unwrapped with the OEM RSA private key
+
+▶ [S5] Build the fuse blob (encrypt-then-MAC with FSKP_EK / FSKP_AK)
+   ✔ fuse blob 321 B: AES-CTR(FSKP_EK) + HMAC-SHA256(FSKP_AK); only a BootROM can open it
+
+▶ [S6–S8] UEFI PK / KEK / db keys, certificate chain, signed .auth updates
+   ✔ PK.auth (self-signed) · KEK.auth (signed by PK) · db.auth (signed by KEK)
+   · each .auth = EFI_TIME + WIN_CERTIFICATE_UEFI_GUID(PKCS#7) + EFI_SIGNATURE_LIST; signature covers VariableName ‖ VendorGuid ‖ Attributes ‖ TimeStamp ‖ Data
+
+▶ [S9] Sign the NVIDIA boot chain with the PKC key
+   ✔ 8 boot-chain images signed (BootROM/MB1/MB2 verify against PKC_HASH fuse)
+
+▶ [S10–S13] CPYR code (dm-verity), CPYR data (LUKS), encrypted + db-signed boot entry
+   · REAL CPYR conv_enocder: 62 parameters, model.pt 2969 B, threshold 0.5058
+   · S10 CPYR code partition 12288 B → dm-verity root d3f27fcdb98f39f4… (goes into the initrd)
+   · S11 disk_enc.key generated → EKB (luks-srv derives LUKS passphrases from it)
+   · S12 CPYR data partition: LUKS aes-xts-plain64 (512-bit DEK), keyslot 0 = generic passphrase; inside it model.bin.enc (2997 B, AES-256-GCM with the CPYR model key)
+   ✔ S13 kernel + initrd encrypted with the payload key; boot entry signed with the db key (RSA-2048)
+
+▶ [S14–S16] Golden PCRs, EKB, backend
+   · golden PCR0  = 1dbfb174ee2ac4af…  NVIDIA boot chain
+   · golden PCR4  = cd79e33f95f27ad6…  UEFI boot entry
+   · golden PCR7  = 59ad6669472a2bfb…  Secure Boot policy (PK/KEK/db/dbx)
+   · golden PCR10 = 5a22184201acac42…  IMA (CPYR files)
+   ✔ S14 EKB contents ready: payload key · disk key · model key · alert key · PCR policy (encrypted per device with KDF(OEM_K1, ECID) at flash time)
+   ✔ S16 backend stores golden PCRs + manufacturer CA public key
+
+▶ [S17] Release the factory package (no private keys, no plaintext secrets)
+   ✔ package: encrypted fuse blob · signed boot chain · .auth updates · encrypted boot entry · dm-verity code partition · LUKS data partition
+   · EKB is produced per unit by the HSM-side flashing service (needs OEM_K1 + ECID)
+
+▶ [S18–S20] Factory: receive package, RCM mode, send encrypted fuse blob
+   · factory sees only ciphertext: fuse blob entropy 7.33 bits/byte
+
+▶ [S21–S23] BootROM re-derives FSKP keys, authenticates + decrypts, burns, read-back
+   ✔ OEM_K1/K2 + PKC_HASH burned; read-back OK
+
+▶ [S25] Burn the security-mode fuse LAST
+   ✔ debug locked; BootROM now enforces PKC signatures
+
+▶ [S26–S27] Mass-flash + enrol UEFI variables (setup mode → user mode)
+   ✔ SetVariable(PK.auth, KEK.auth, db.auth) accepted; PK enrolled → user mode
+   ✔ EKB for ECID cb3afd766d6303cd produced by the HSM flashing service and written
+
+▶ [S28–S30 + B1–B9] First boot (generic LUKS passphrase → per-device re-key)
+
+▶ [B1–B3] BootROM + PSCROM → MB1 → MB2 (PKC secure boot)
+   ✔ 8 images verified against the PKC_HASH fuse: BR-BCT, MB1, MB1-BCT, PSC-FW, BPMP-FW, MB2, TOS (ATF BL31 + OP-TEE + TAs), UEFI (uefi_jetson.bin)
+
+▶ [B4] Secure world: ATF BL31 + OP-TEE; EKB opened with KDF(OEM_K1, ECID); fTPM up
+   ✔ EKB opened in S-EL1: payload key · disk key · model key · alert key · PCR policy
+   ✔ fTPM TA: EK derived from fuses; PCR0 replayed = 1dbfb174ee2ac4af…
+
+▶ [B5] UEFI: measure Secure Boot vars, verify boot entry (db/dbx), decrypt via OP-TEE
+   ✔ 'Jetson Linux + CPYR v2.0' trusted by db, not in dbx → PCR4; kernel + initrd decrypted by the OP-TEE payload TA
+   ✔ ExitBootServices → payload TA SRV_DOWN
+
+▶ [B6] Linux kernel: optee driver (/dev/tee0), tpm_ftpm_tee (/dev/tpm0), IMA, dm-crypt, dm-verity
+   ✔ SMC channel to OP-TEE established; fTPM exposed as /dev/tpm0
+   ⚠ requirement: fTPM must be up before IMA initialises, or IMA runs without extending PCR10 (verify on the BSP)
+
+▶ [B7] initrd: LUKS unlock via luks-srv (+ re-key on first boot), dm-verity open, switch_root
+   ✔ generic passphrase opens keyslot 0 (factory-wide image)
+   ✔ re-key: per-device passphrase = KDF(KDF(disk key, 'luks-srv-ecid', ECID), 'luks-srv-passphrase-unique', UUID) → keyslot 1; generic keyslot 0 removed
+   · only the keyslot changed: the same DEK is re-wrapped, no data re-encrypted
+   ✔ nvluks-srv-app → LUKS_SRV_TA_CMD_SRV_DOWN
+   ✔ dm-verity: CPYR code partition verified against the root hash in the signed initrd
+
+▶ [B8] rootfs services: tee-supplicant, tpm2-tss (/dev/tpmrm0), SocketCAN, attestation agent
+   ✔ normal world issues requests; keys stay in the secure world
+
+▶ [B9] CPYR starts: IMA → PCR10, cpyr-ta checks PCR policy, model decrypted in RAM
+   · IMA sha256 cfb0c8b2c9662c8a…  basemodel.py      → PCR10
+   · IMA sha256 e3204b59329892b3…  conv_encoder.py   → PCR10
+   · IMA sha256 8cfe34f8056ce74c…  cpyr_detector.py  → PCR10
+   · IMA sha256 e156343c19376425…  manifest.json     → PCR10
+   · IMA sha256 bb2263aa176d7a23…  model.bin.enc     → PCR10
+   ✔ PCR policy matched → model key released once, cpyr-ta SRV_DOWN; weights hash matches manifest
+   ✔ CPYR v2.0 running (torch.load weights_only=True, repo conv_enocder)
+
+▶ [S31–S33] Read EK public key + ECID, CA signs the EK certificate, register device
+   ✔ device registered: ECID · EK certificate · alert public key
+
+▶ [S34–S37] End-of-line attestation
+
+▶ [B10] Remote attestation: nonce → fTPM quote (AK) + event log → verify → session credential
+   ✔ AK → EK → manufacturer CA · signature · nonce · event-log replay
+   ✔ all PCRs match golden → short-lived session credential issued (bound to this AK)
+
+▶ [S38–S39 + B11] Primary analytics: CPYR report signed in OP-TEE (PKCS#11), sent over the attested session
+   ✔ NORMAL:   6 windows,   0 flagged (threshold 0.505822)
+   ✔ ATTACK:  11 windows,  11 flagged (threshold 0.505822)
+   ✔ END   :   5 windows,   0 flagged (threshold 0.505822)
+   ✔ backend: report #1 accepted from ECID cb3afd766d6303cd (session + alert-key signature valid)
+
+▶ [S39–S40] Record in manufacturing DB, ship
+   ✔ LUKS header holds no generic keyslot
+   ✔ functional test: test pattern produced alerts only in the ATTACK phase
+   ✔ unit SHIPPED
+
+==============================================================================
+  FIELD · second boot (per-device LUKS passphrase)
+==============================================================================
+
+▶ [B1–B3] BootROM + PSCROM → MB1 → MB2 (PKC secure boot)
+   ✔ 8 images verified against the PKC_HASH fuse: BR-BCT, MB1, MB1-BCT, PSC-FW, BPMP-FW, MB2, TOS (ATF BL31 + OP-TEE + TAs), UEFI (uefi_jetson.bin)
+
+▶ [B4] Secure world: ATF BL31 + OP-TEE; EKB opened with KDF(OEM_K1, ECID); fTPM up
+   ✔ EKB opened in S-EL1: payload key · disk key · model key · alert key · PCR policy
+   ✔ fTPM TA: EK derived from fuses; PCR0 replayed = 1dbfb174ee2ac4af…
+
+▶ [B5] UEFI: measure Secure Boot vars, verify boot entry (db/dbx), decrypt via OP-TEE
+   ✔ 'Jetson Linux + CPYR v2.0' trusted by db, not in dbx → PCR4; kernel + initrd decrypted by the OP-TEE payload TA
+   ✔ ExitBootServices → payload TA SRV_DOWN
+
+▶ [B6] Linux kernel: optee driver (/dev/tee0), tpm_ftpm_tee (/dev/tpm0), IMA, dm-crypt, dm-verity
+   ✔ SMC channel to OP-TEE established; fTPM exposed as /dev/tpm0
+   ⚠ requirement: fTPM must be up before IMA initialises, or IMA runs without extending PCR10 (verify on the BSP)
+
+▶ [B7] initrd: LUKS unlock via luks-srv (+ re-key on first boot), dm-verity open, switch_root
+   ✔ per-device passphrase from luks-srv opens keyslot 1
+   ✔ nvluks-srv-app → LUKS_SRV_TA_CMD_SRV_DOWN
+   ✔ dm-verity: CPYR code partition verified against the root hash in the signed initrd
+
+▶ [B8] rootfs services: tee-supplicant, tpm2-tss (/dev/tpmrm0), SocketCAN, attestation agent
+   ✔ normal world issues requests; keys stay in the secure world
+
+▶ [B9] CPYR starts: IMA → PCR10, cpyr-ta checks PCR policy, model decrypted in RAM
+   · IMA sha256 cfb0c8b2c9662c8a…  basemodel.py      → PCR10
+   · IMA sha256 e3204b59329892b3…  conv_encoder.py   → PCR10
+   · IMA sha256 8cfe34f8056ce74c…  cpyr_detector.py  → PCR10
+   · IMA sha256 e156343c19376425…  manifest.json     → PCR10
+   · IMA sha256 bb2263aa176d7a23…  model.bin.enc     → PCR10
+   ✔ PCR policy matched → model key released once, cpyr-ta SRV_DOWN; weights hash matches manifest
+   ✔ CPYR v2.0 running (torch.load weights_only=True, repo conv_enocder)
+
+▶ [B10] Remote attestation: nonce → fTPM quote (AK) + event log → verify → session credential
+   ✔ AK → EK → manufacturer CA · signature · nonce · event-log replay
+   ✔ all PCRs match golden → short-lived session credential issued (bound to this AK)
+
+▶ [B11] Primary analytics: CPYR report signed in OP-TEE (PKCS#11), sent over the attested session
+   ✔ NORMAL:   6 windows,   0 flagged (threshold 0.505822)
+   ✔ ATTACK:  11 windows,  11 flagged (threshold 0.505822)
+   ✔ backend: report #2 accepted from ECID cb3afd766d6303cd (session + alert-key signature valid)
+
+   RESULT: as expected — manufactured, attested, shipped; field boot attested and reporting
+
+==============================================================================
+  SCENARIO: forged-fuse-blob — Rogue or modified fuse blob at the factory   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Factory insider builds a fuse blob with their own PKC hash (no FSKP keys)
+   ✔ BootROM: fuse blob authentication failed (FSKP_AK) — nothing burned
+
+▶ [ATTACK] Flip one bit of the genuine blob in transit
+   ✔ BootROM: fuse blob authentication failed (FSKP_AK) — nothing burned
+
+   RESULT: as expected — only blobs authenticated with FSKP_AK are burned
+
+==============================================================================
+  SCENARIO: disk-theft — Pull the NVMe / move it to another unit   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Pull the NVMe: read the CPYR data partition offline
+   · LUKS data partition: 12288 B, entropy 7.98 bits/byte (AES-XTS ciphertext)
+   ✔ even a leaked generic passphrase fails: the unit was re-keyed on first boot
+
+▶ [ATTACK] Move the NVMe to another Jetson (different ECID)
+   ✔ other unit: cryptsetup: no keyslot opens with this passphrase (its ECID derives a different passphrase)
+
+   RESULT: as expected — LUKS ciphertext; per-device passphrase bound to ECID + disk UUID
+
+==============================================================================
+  SCENARIO: tamper-model — Flip bytes in the LUKS data partition   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Flip a byte in the LUKS ciphertext of the data partition
+   · AES-XTS has no integrity: the sector decrypts to garbage without an error
+
+▶ [B1–B3] BootROM + PSCROM → MB1 → MB2 (PKC secure boot)
+   ✔ 8 images verified against the PKC_HASH fuse: BR-BCT, MB1, MB1-BCT, PSC-FW, BPMP-FW, MB2, TOS (ATF BL31 + OP-TEE + TAs), UEFI (uefi_jetson.bin)
+
+▶ [B4] Secure world: ATF BL31 + OP-TEE; EKB opened with KDF(OEM_K1, ECID); fTPM up
+   ✔ EKB opened in S-EL1: payload key · disk key · model key · alert key · PCR policy
+   ✔ fTPM TA: EK derived from fuses; PCR0 replayed = a11b2930633ca49f…
+
+▶ [B5] UEFI: measure Secure Boot vars, verify boot entry (db/dbx), decrypt via OP-TEE
+   ✔ 'Jetson Linux + CPYR v2.0' trusted by db, not in dbx → PCR4; kernel + initrd decrypted by the OP-TEE payload TA
+   ✔ ExitBootServices → payload TA SRV_DOWN
+
+▶ [B6] Linux kernel: optee driver (/dev/tee0), tpm_ftpm_tee (/dev/tpm0), IMA, dm-crypt, dm-verity
+   ✔ SMC channel to OP-TEE established; fTPM exposed as /dev/tpm0
+   ⚠ requirement: fTPM must be up before IMA initialises, or IMA runs without extending PCR10 (verify on the BSP)
+
+▶ [B7] initrd: LUKS unlock via luks-srv (+ re-key on first boot), dm-verity open, switch_root
+   ✔ per-device passphrase from luks-srv opens keyslot 1
+   ✔ nvluks-srv-app → LUKS_SRV_TA_CMD_SRV_DOWN
+   ✔ dm-verity: CPYR code partition verified against the root hash in the signed initrd
+
+▶ [B8] rootfs services: tee-supplicant, tpm2-tss (/dev/tpmrm0), SocketCAN, attestation agent
+   ✔ normal world issues requests; keys stay in the secure world
+
+▶ [B9] CPYR starts: IMA → PCR10, cpyr-ta checks PCR policy, model decrypted in RAM
+   · IMA sha256 cfb0c8b2c9662c8a…  basemodel.py      → PCR10
+   · IMA sha256 e3204b59329892b3…  conv_encoder.py   → PCR10
+   · IMA sha256 8cfe34f8056ce74c…  cpyr_detector.py  → PCR10
+   · IMA sha256 e156343c19376425…  manifest.json     → PCR10
+   · IMA sha256 8a8a7cfbed940483…  model.bin.enc     → PCR10
+   ✘ cpyr-ta: PCR policy mismatch (de9f93d5faa6b2cd… ≠ sealed 1eb479cf1090c9a0…) — model key NOT released
+   ✘ CPYR cannot decrypt its model → not started
+
+▶ [B10] Remote attestation: nonce → fTPM quote (AK) + event log → verify → session credential
+   ✔ AK → EK → manufacturer CA · signature · nonce · event-log replay
+   ✘ PCR10 ≠ golden — IMA (CPYR files)
+   ✘ device NOT in a known-good state → quarantine, no credential
+
+   RESULT: as expected — XTS garbles silently; GCM / IMA / PCR policy catch it
+
+==============================================================================
+  SCENARIO: blind-detector — Patch detector + rebuild verity tree   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Patch the detector to never alert and rebuild the dm-verity tree
+   · attacker's tree is self-consistent (root cba8bf3b7ff3a660…) but the trusted root is in the signed initrd
+
+▶ [B1–B3] BootROM + PSCROM → MB1 → MB2 (PKC secure boot)
+   ✔ 8 images verified against the PKC_HASH fuse: BR-BCT, MB1, MB1-BCT, PSC-FW, BPMP-FW, MB2, TOS (ATF BL31 + OP-TEE + TAs), UEFI (uefi_jetson.bin)
+
+▶ [B4] Secure world: ATF BL31 + OP-TEE; EKB opened with KDF(OEM_K1, ECID); fTPM up
+   ✔ EKB opened in S-EL1: payload key · disk key · model key · alert key · PCR policy
+   ✔ fTPM TA: EK derived from fuses; PCR0 replayed = 22c3e37ffdab3b1a…
+
+▶ [B5] UEFI: measure Secure Boot vars, verify boot entry (db/dbx), decrypt via OP-TEE
+   ✔ 'Jetson Linux + CPYR v2.0' trusted by db, not in dbx → PCR4; kernel + initrd decrypted by the OP-TEE payload TA
+   ✔ ExitBootServices → payload TA SRV_DOWN
+
+▶ [B6] Linux kernel: optee driver (/dev/tee0), tpm_ftpm_tee (/dev/tpm0), IMA, dm-crypt, dm-verity
+   ✔ SMC channel to OP-TEE established; fTPM exposed as /dev/tpm0
+   ⚠ requirement: fTPM must be up before IMA initialises, or IMA runs without extending PCR10 (verify on the BSP)
+
+▶ [B7] initrd: LUKS unlock via luks-srv (+ re-key on first boot), dm-verity open, switch_root
+   ✔ per-device passphrase from luks-srv opens keyslot 1
+   ✔ nvluks-srv-app → LUKS_SRV_TA_CMD_SRV_DOWN
+   ✘ dm-verity: hash tree root ≠ trusted root carried in the signed initrd
+   ✘ CPYR code partition refused — CPYR not started
+
+   RESULT: as expected — rebuilt tree rejected: root hash anchored in the db-signed initrd
+
+==============================================================================
+  SCENARIO: tamper-initrd — Modify the encrypted, db-signed initrd   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Modify the encrypted initrd in the boot entry
+
+▶ [B1–B3] BootROM + PSCROM → MB1 → MB2 (PKC secure boot)
+   ✔ 8 images verified against the PKC_HASH fuse: BR-BCT, MB1, MB1-BCT, PSC-FW, BPMP-FW, MB2, TOS (ATF BL31 + OP-TEE + TAs), UEFI (uefi_jetson.bin)
+
+▶ [B4] Secure world: ATF BL31 + OP-TEE; EKB opened with KDF(OEM_K1, ECID); fTPM up
+   ✔ EKB opened in S-EL1: payload key · disk key · model key · alert key · PCR policy
+   ✔ fTPM TA: EK derived from fuses; PCR0 replayed = b2366fcccfcd7656…
+
+▶ [B5] UEFI: measure Secure Boot vars, verify boot entry (db/dbx), decrypt via OP-TEE
+   ✘ UEFI: boot entry signature not trusted by any db certificate
+
+   RESULT: as expected — UEFI Secure Boot refused the modified boot entry
+
+==============================================================================
+  SCENARIO: db-inject — Root enrols own key via a self-signed .auth   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Root builds db.auth signed with its own key
+   ✔ EFI_SECURITY_VIOLATION: SetVariable(db) rejected: signature does not verify against KEK
+   ✔ EFI_SECURITY_VIOLATION: SetVariable(KEK) rejected: signature does not verify against PK
+
+   RESULT: as expected — db needs a KEK signature, KEK needs a PK signature
+
+==============================================================================
+  SCENARIO: auth-replay — Replay an old db.auth / retarget it to KEK   [real CPYR]
+==============================================================================
+
+▶ [SETUP] OEM rotates db: new db certificate, signed db.auth with a newer timestamp
+   ✔ db now trusts only the new signer
+
+▶ [ATTACK] Replay the original, genuinely signed db.auth to restore the old certificate
+   ✔ SetVariable(db) rejected: timestamp not newer than the stored one (replay)
+
+▶ [ATTACK] Retarget a genuine KEK-signed update to dbx (same signer authority, different variable)
+   ✔ SetVariable(dbx) rejected: signature does not verify against KEK — name + VendorGuid are inside the signed bytes
+
+   RESULT: as expected — timestamp blocks replay; name + VendorGuid bind the signature to one variable
+
+==============================================================================
+  SCENARIO: downgrade — Flash old signed v1.0, then revoke via dbx.auth   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Flash the old but genuinely signed release v1.0
+   ⚠ v1.0 is signed by our db key — Secure Boot alone accepts it
+
+▶ [B1–B3] BootROM + PSCROM → MB1 → MB2 (PKC secure boot)
+   ✔ 8 images verified against the PKC_HASH fuse: BR-BCT, MB1, MB1-BCT, PSC-FW, BPMP-FW, MB2, TOS (ATF BL31 + OP-TEE + TAs), UEFI (uefi_jetson.bin)
+
+▶ [B4] Secure world: ATF BL31 + OP-TEE; EKB opened with KDF(OEM_K1, ECID); fTPM up
+   ✔ EKB opened in S-EL1: payload key · disk key · model key · alert key · PCR policy
+   ✔ fTPM TA: EK derived from fuses; PCR0 replayed = 395d4fcb3ec33f89…
+
+▶ [B5] UEFI: measure Secure Boot vars, verify boot entry (db/dbx), decrypt via OP-TEE
+   ✔ 'Jetson Linux + CPYR v1.0' trusted by db, not in dbx → PCR4; kernel + initrd decrypted by the OP-TEE payload TA
+   ✔ ExitBootServices → payload TA SRV_DOWN
+
+▶ [B6] Linux kernel: optee driver (/dev/tee0), tpm_ftpm_tee (/dev/tpm0), IMA, dm-crypt, dm-verity
+   ✔ SMC channel to OP-TEE established; fTPM exposed as /dev/tpm0
+   ⚠ requirement: fTPM must be up before IMA initialises, or IMA runs without extending PCR10 (verify on the BSP)
+
+▶ [B7] initrd: LUKS unlock via luks-srv (+ re-key on first boot), dm-verity open, switch_root
+   ✔ per-device passphrase from luks-srv opens keyslot 1
+   ✔ nvluks-srv-app → LUKS_SRV_TA_CMD_SRV_DOWN
+   ✔ dm-verity: CPYR code partition verified against the root hash in the signed initrd
+
+▶ [B8] rootfs services: tee-supplicant, tpm2-tss (/dev/tpmrm0), SocketCAN, attestation agent
+   ✔ normal world issues requests; keys stay in the secure world
+
+▶ [B9] CPYR starts: IMA → PCR10, cpyr-ta checks PCR policy, model decrypted in RAM
+   · IMA sha256 cfb0c8b2c9662c8a…  basemodel.py      → PCR10
+   · IMA sha256 e3204b59329892b3…  conv_encoder.py   → PCR10
+   · IMA sha256 1a6cb7a25615a010…  cpyr_detector.py  → PCR10
+   · IMA sha256 13288cdfb8f13805…  manifest.json     → PCR10
+   · IMA sha256 b7140f9f446a96ed…  model.bin.enc     → PCR10
+   ✘ cpyr-ta: PCR policy mismatch (21f29eb56faed7a4… ≠ sealed 3dc2d6cec7a16d18…) — model key NOT released
+   ✘ CPYR cannot decrypt its model → not started
+
+▶ [B10] Remote attestation: nonce → fTPM quote (AK) + event log → verify → session credential
+   ✔ AK → EK → manufacturer CA · signature · nonce · event-log replay
+   ✘ PCR4 ≠ golden — UEFI boot entry
+   ✘ PCR10 ≠ golden — IMA (CPYR files)
+   ✘ device NOT in a known-good state → quarantine, no credential
+
+▶ [REMEDIATION] OEM pushes dbx.auth (append, signed by KEK) revoking the v1.0 boot entry
+   ✔ dbx updated (APPEND_WRITE, authorised by KEK)
+   ✔ v1.0 no longer boots: boot entry hash is in dbx (revoked) — refusing to boot
+
+   RESULT: as expected — signed ≠ current: PCR policy + attestation caught it; dbx closes it
+
+==============================================================================
+  SCENARIO: ta-closed — Call payload TA / luks-srv / cpyr-ta after boot   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Root opens /dev/tee0 and calls payload TA, luks-srv and cpyr-ta after boot
+   ✔ payload: TEE_ERROR_ACCESS_DENIED — service shut down (SRV_DOWN) until reset
+   ✔ luks-srv: TEE_ERROR_ACCESS_DENIED — service shut down (SRV_DOWN) until reset
+   ✔ cpyr-ta: TEE_ERROR_ACCESS_DENIED — service shut down (SRV_DOWN) until reset
+
+   RESULT: as expected — every key-serving TA is SRV_DOWN after use
+
+==============================================================================
+  SCENARIO: ta-left-open — Same, SRV_DOWN skipped (CVE-2026-24153 pattern)   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Root opens /dev/tee0 and calls payload TA, luks-srv and cpyr-ta after boot
+   ✘ payload TA answered after boot
+   ✘ luks-srv answered after boot
+   ✘ cpyr-ta answered after boot
+   ⚠ CVE-2026-24153 pattern: a key-serving TA reachable after boot
+
+   RESULT: as expected — demonstrates why SRV_DOWN matters (leak expected)
+
+==============================================================================
+  SCENARIO: replay-quote — Replay an old healthy quote   [real CPYR]
+==============================================================================
+
+▶ [B10] Remote attestation: nonce → fTPM quote (AK) + event log → verify → session credential
+   ✘ stale quote: nonce mismatch (replay)
+
+   RESULT: as expected — fresh nonce defeats replay
+
+==============================================================================
+  SCENARIO: forged-log — Tamper the measured-boot event log   [real CPYR]
+==============================================================================
+
+▶ [B10] Remote attestation: nonce → fTPM quote (AK) + event log → verify → session credential
+   ✘ event log does not replay to the quoted PCRs (log tampered)
+
+   RESULT: as expected — forged log does not replay to the signed PCRs
+
+==============================================================================
+  SCENARIO: unattested-analytics — Send analytics without / after attestation   [real CPYR]
+==============================================================================
+
+▶ [ATTACK] Send analytics without attesting first
+
+▶ [B11] Primary analytics: CPYR report signed in OP-TEE (PKCS#11), sent over the attested session
+   ✔ ATTACK:  11 windows,  11 flagged (threshold 0.505822)
+   ✘ backend: no valid attested session — analytics rejected
+
+▶ [ATTACK] Attest, then reuse the credential after it expires
+
+▶ [B11] Primary analytics: CPYR report signed in OP-TEE (PKCS#11), sent over the attested session
+   ✔ ATTACK:  11 windows,  11 flagged (threshold 0.505822)
+   ✘ backend: no valid attested session — analytics rejected
+
+   RESULT: as expected — analytics accepted only over a live attested session
+
+==============================================================================
+  SUMMARY
+==============================================================================
+  PASS  normal                 manufactured, attested, shipped; field boot attested and reporting
+  PASS  forged-fuse-blob       only blobs authenticated with FSKP_AK are burned
+  PASS  disk-theft             LUKS ciphertext; per-device passphrase bound to ECID + disk UUID
+  PASS  tamper-model           XTS garbles silently; GCM / IMA / PCR policy catch it
+  PASS  blind-detector         rebuilt tree rejected: root hash anchored in the db-signed initrd
+  PASS  tamper-initrd          UEFI Secure Boot refused the modified boot entry
+  PASS  db-inject              db needs a KEK signature, KEK needs a PK signature
+  PASS  auth-replay            timestamp blocks replay; name + VendorGuid bind the signature to one variable
+  PASS  downgrade              signed ≠ current: PCR policy + attestation caught it; dbx closes it
+  PASS  ta-closed              every key-serving TA is SRV_DOWN after use
+  PASS  ta-left-open           demonstrates why SRV_DOWN matters (leak expected)
+  PASS  replay-quote           fresh nonce defeats replay
+  PASS  forged-log             forged log does not replay to the signed PCRs
+  PASS  unattested-analytics   analytics accepted only over a live attested session
